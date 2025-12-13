@@ -28,6 +28,8 @@ from typing import List, Optional
 DEFAULT_COMMAND = ["npm", "run", "dev"]
 DEFAULT_URL = "http://localhost:3000"
 DEFAULT_WAIT_SECS = 60
+# Common dev ports to probe if the primary URL is not responding (Vite often auto-increments).
+FALLBACK_PORTS = [3000] + list(range(5173, 5184))
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +58,7 @@ def find_chrome(explicit_path: Optional[str]) -> Optional[str]:
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     ]
@@ -65,20 +68,31 @@ def find_chrome(explicit_path: Optional[str]) -> Optional[str]:
     return None
 
 
-def wait_for_server(url: str, timeout_secs: int) -> bool:
+def wait_for_server(urls: List[str], timeout_secs: int) -> Optional[str]:
+    """Poll a list of URLs until one responds; return the first responsive URL."""
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:  # noqa: S310
-                if resp.status < 500:
-                    return True
-        except (urllib.error.URLError, ConnectionError):
-            time.sleep(1)
-    return False
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:  # noqa: S310
+                    if resp.status < 500:
+                        return url
+            except (urllib.error.URLError, ConnectionError):
+                continue
+        time.sleep(1)
+    return None
 
 
 def open_browser(chrome_path: str, url: str) -> subprocess.Popen:
-    args = [chrome_path, "--kiosk", "--start-fullscreen", "--disable-infobars", url]
+    args = [
+        chrome_path,
+        "--incognito",
+        "--kiosk",
+        "--start-fullscreen",
+        "--disable-infobars",
+        "--force-device-scale-factor=1.1",  # 110% zoom
+        url,
+    ]
     return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -92,6 +106,7 @@ def main() -> int:
     project_dir: Path = args.project_dir
     dev_command = args.command if args.command else DEFAULT_COMMAND
     url = args.url
+    fallback_urls = list({url} | {f"http://localhost:{p}" for p in FALLBACK_PORTS})
 
     if not project_dir.exists():
         print(f"[error] project dir does not exist: {project_dir}", file=sys.stderr)
@@ -100,10 +115,13 @@ def main() -> int:
     print(f"[info] starting dev server in {project_dir} with: {' '.join(dev_command)}")
     dev_proc = run_dev_server(project_dir, args.command)
 
-    if not wait_for_server(url, args.wait_secs):
-        print(f"[warn] server did not respond at {url} within {args.wait_secs}s", file=sys.stderr)
+    responsive_url = wait_for_server(fallback_urls, args.wait_secs)
+    if not responsive_url:
+        print(f"[warn] server did not respond at any of {fallback_urls} within {args.wait_secs}s", file=sys.stderr)
+        print("       If your dev server binds elsewhere, pass --url http://host:port", file=sys.stderr)
     else:
-        print(f"[info] server is responding at {url}")
+        print(f"[info] server is responding at {responsive_url}")
+        url = responsive_url
 
     if args.no_open:
         return 0
