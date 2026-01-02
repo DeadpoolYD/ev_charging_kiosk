@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode, useMemo } from 'react';
 import type { User, ChargingSession, SystemSettings } from '../types';
 import { db } from '../services/database';
 import { hardware } from '../services/hardware';
@@ -59,8 +59,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const activeSession = db.getActiveSession();
     if (activeSession) {
       setCurrentSession(activeSession);
-      const user = db.getUsers().find((u) => u.id === activeSession.userId);
-      if (user) setCurrentUser(user);
+      // Load user from backend
+      const loadUser = async () => {
+        try {
+          const users = await db.getUsers();
+          const user = users.find((u) => u.id === activeSession.userId);
+          if (user) setCurrentUser(user);
+        } catch (error) {
+          // Fallback to sync version
+          const users = db.getUsersSync();
+          const user = users.find((u) => u.id === activeSession.userId);
+          if (user) setCurrentUser(user);
+        }
+      };
+      loadUser();
     }
 
     // Load settings
@@ -116,20 +128,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  // Memoize context value to prevent unnecessary re-renders
+  const contextValue = useMemo(
+    () => ({
+      currentUser,
+      setCurrentUser,
+      currentSession,
+      setCurrentSession,
+      settings,
+      updateSettings,
+      scanRfid,
+      batteryStatus,
+      refreshBatteryStatus,
+    }),
+    [
+      currentUser,
+      currentSession,
+      settings,
+      updateSettings,
+      scanRfid,
+      batteryStatus,
+      refreshBatteryStatus,
+    ]
+  );
+
   return (
-    <AppContext.Provider
-      value={{
-        currentUser,
-        setCurrentUser,
-        currentSession,
-        setCurrentSession,
-        settings,
-        updateSettings,
-        scanRfid,
-        batteryStatus,
-        refreshBatteryStatus,
-      }}
-    >
+    <AppContext.Provider value={contextValue}>
       {children}
     </AppContext.Provider>
   );

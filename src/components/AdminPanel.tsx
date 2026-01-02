@@ -23,15 +23,21 @@ export default function AdminPanel() {
     setNewSettings(settings);
   }, [settings]);
 
-  const loadData = () => {
-    const allUsers = db.getUsers();
-    setUsers(allUsers);
-    setTransactions(db.getTransactions().sort((a, b) => 
-      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    ));
+  const loadData = async () => {
+    try {
+      const allUsers = await db.getUsers();
+      setUsers(allUsers);
+      setTransactions(db.getTransactions().sort((a, b) => 
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      ));
+    } catch (error) {
+      console.error('[AdminPanel] Failed to load users:', error);
+      // Fallback to sync version
+      setUsers(db.getUsersSync());
+    }
   };
 
-  const handleBalanceAdjustment = (userId: string, amount: number, type: 'add' | 'deduct') => {
+  const handleBalanceAdjustment = async (userId: string, amount: number, type: 'add' | 'deduct') => {
     const user = users.find((u) => u.id === userId);
     if (!user) return;
 
@@ -43,7 +49,10 @@ export default function AdminPanel() {
       return;
     }
 
-    db.updateUserBalance(userId, newBalance);
+    // Update via backend API (syncs to Google Sheets)
+    await db.updateUserBalance(userId, newBalance);
+    
+    // Add transaction locally (transactions don't need Google Sheets)
     db.addTransaction({
       id: Date.now().toString(),
       userId: user.id,
@@ -54,7 +63,7 @@ export default function AdminPanel() {
       description: `Admin ${type === 'add' ? 'added' : 'deducted'} balance`,
     });
 
-    loadData();
+    await loadData(); // Reload from backend to get updated data
     setBalanceAdjustment('');
     setSelectedUser(null);
   };
@@ -131,14 +140,16 @@ export default function AdminPanel() {
                     <div className="flex-1">
                       <div className="font-semibold text-gray-900 text-lg">{user.name}</div>
                       <button
-                        onClick={() => {
+                        onClick={async () => {
                           const newRfid = prompt(`Enter new RFID card ID for ${user.name}:`, user.rfidCardId);
                           if (newRfid && newRfid.trim() !== '') {
-                            const updatedUsers = users.map((u) =>
-                              u.id === user.id ? { ...u, rfidCardId: newRfid.trim() } : u
-                            );
-                            db.saveUsers(updatedUsers);
-                            loadData();
+                            // Update via backend API (syncs to Google Sheets)
+                            const updated = await db.updateUser(user.id, { rfidCardId: newRfid.trim() });
+                            if (updated) {
+                              await loadData(); // Reload from backend
+                            } else {
+                              alert('Failed to update RFID card ID. Please try again.');
+                            }
                           }
                         }}
                         className="text-sm text-blue-600 hover:text-blue-700 hover:underline mt-1 cursor-pointer"

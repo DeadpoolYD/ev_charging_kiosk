@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RFID-controlled EV Charging Kiosk Backend Service
-Handles MFRC522 RFID reader, GPIO relay control, and user management
+Handles MFRC522 RFID reader, GPIO relay control, and user management via Google Sheets
 """
 
 import json
@@ -18,7 +18,7 @@ from flask_cors import CORS
 # Try to import hardware libraries (will fail gracefully if not on Raspberry Pi)
 try:
     import RPi.GPIO as GPIO
-    from mfrc522 import SimpleMFRC522
+    from mfrc522 import SimpleMFRC522  # pyright: ignore[reportMissingImports]
     HARDWARE_AVAILABLE = True
 except ImportError:
     HARDWARE_AVAILABLE = False
@@ -27,9 +27,10 @@ except ImportError:
     class SimpleMFRC522:
         def read(self):
             # Simulate waiting for card (blocking like real reader)
+            # In mock mode, simulate no card present by raising timeout exception
+            # This prevents continuous false detections
             time.sleep(1)
-            # Return actual card ID for testing: 632589166397 (Lalit's card)
-            return (632589166397, "Lalit")
+            raise TimeoutError("No card detected")
     
     class GPIO:
         OUT = 1
@@ -49,10 +50,36 @@ except ImportError:
         def cleanup():
             pass
 
+# Try to import Google Sheets API
+try:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    GOOGLE_SHEETS_AVAILABLE = True
+except ImportError:
+    GOOGLE_SHEETS_AVAILABLE = False
+    print("[WARNING] Google Sheets API not available. Install: pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+
+# ============================================================
+# 📝 GOOGLE SHEETS CONFIGURATION
+# ============================================================
+SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
+SPREADSHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '1etezPbLCeZaYXaJtQlwRjCz0lnizOq2xVYppEi1eag8')
+SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', 'Sheet2')
+RANGE_START_ROW = 2  # Data starts from row 2 (row 1 is header)
+
+# Column mapping
+COL_EID = 0          # Column A = RFID Card ID (EID)
+COL_NAME = 1        # Column B = Name
+COL_CONTACT = 2     # Column C = Contact Number
+COL_BALANCE = 3     # Column D = Current Balance
+
+# Polling interval for Google Sheets (seconds)
+SHEETS_POLL_INTERVAL = 3  # Check Google Sheets every 3 seconds (reduced for better sync)
+last_sheets_poll = 0
+
 # Configuration
 RELAY_PIN = 18  # GPIO pin for relay control (BCM numbering)
 RFID_READER = None
-DATA_FILE = Path(__file__).parent / "users_data.json"
 CHARGING_RATE_PER_SECOND = 0.01  # Balance deduction per second while charging (₹0.01/sec = ₹36/hour)
 
 # Flask app setup
@@ -73,101 +100,384 @@ rfid_event_queue = queue.Queue(maxsize=10)
 rfid_reading_active = False
 last_rfid_read = None
 last_rfid_read_time = 0
-RFID_DEBOUNCE_SECONDS = 3  # Ignore same card for 3 seconds
+RFID_DEBOUNCE_SECONDS = 5  # Ignore same card for 5 seconds
 
-# Default users (Lait, Nishad, Fateen)
-DEFAULT_USERS = [
-    {
-        "id": "1",
-        "name": "Lalit Nikumbh",
-        "rfidCardId": "632589166397",
-        "balance": 100.0,
-        "phoneNumber": "+91 9876543212",
-        "createdAt": "2024-01-01T00:00:00.000Z"
-    },
-    {
-        "id": "2",
-        "name": "Fateen Shaikh",
-        "rfidCardId": "RFID002",
-        "balance": 150.0,
-        "phoneNumber": "+91 9876543213",
-        "createdAt": "2024-01-01T00:00:00.000Z"
-    },
-    {
-        "id": "3",
-        "name": "Nishad Deshmukh",
-        "rfidCardId": "RFID003",
-        "balance": 90.0,
-        "phoneNumber": "+91 9876543214",
-        "createdAt": "2024-01-01T00:00:00.000Z"
-    }
-]
+# User cache with automatic expiration
+user_cache = {
+    "data": None,
+    "timestamp": 0,
+    "lock": threading.Lock()
+}
+CACHE_EXPIRY_SECONDS = 10  # Cache expires after 10 seconds (reduced for better sync)
+
+# Google Sheets service
+sheets_service = None
+
+# ============================================================
+# GOOGLE SHEETS FUNCTIONS
+# ============================================================
+
+def init_google_sheets():
+    """Initialize Google Sheets API"""
+    global sheets_service
+    
+    if not GOOGLE_SHEETS_AVAILABLE:
+        print("[WARNING] Google Sheets API not available. Using fallback mode.")
+        return False
+    
+    try:
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+        creds_path = Path(__file__).parent / SERVICE_ACCOUNT_FILE
+        
+        if not creds_path.exists():
+            print(f"[WARNING] Google credentials file not found: {creds_path}")
+            print("[INFO] Continuing without Google Sheets. Users will be stored locally.")
+            return False
+        
+        creds = Credentials.from_service_account_file(str(creds_path), scopes=SCOPES)
+        sheets_service = build('sheets', 'v4', credentials=creds)
+        
+        print(f"[INFO] ✓ Google Sheets API connected successfully!")
+        print(f"[INFO] Sheet ID: {SPREADSHEET_ID}")
+        print(f"[INFO] Sheet Name: {SHEET_NAME}")
+        return True
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to Google Sheets: {e}")
+        print("[INFO] Continuing without Google Sheets. Users will be stored locally.")
+        return False
 
 
-def load_users() -> list:
-    """Load users from JSON file, create default if not exists"""
-    if DATA_FILE.exists():
-        try:
-            with open(DATA_FILE, 'r') as f:
-                users = json.load(f)
-                # Ensure we have all 3 required users
-                required_names = ["Lalit Nikumbh", "Fateen Shaikh", "Nishad Deshmukh"]
-                existing_names = [u["name"] for u in users]
-                missing = [u for u in DEFAULT_USERS if u["name"] not in existing_names]
-                if missing:
-                    users.extend(missing)
-                    save_users(users)
-                return users
-        except Exception as e:
-            print(f"[ERROR] Failed to load users: {e}")
-            return DEFAULT_USERS.copy()
-    else:
-        save_users(DEFAULT_USERS)
-        return DEFAULT_USERS.copy()
+def fetch_users_from_sheets(force: bool = False) -> list:
+    """Fetch users from Google Sheets (READ from Sheet)"""
+    global last_sheets_poll
+    
+    if not sheets_service:
+        return []
+    
+    current_time = time.time()
+    
+    # Check if we need to poll (respect polling interval unless forced)
+    if not force and (current_time - last_sheets_poll) < SHEETS_POLL_INTERVAL:
+        return []  # Return empty to use cache
+    
+    last_sheets_poll = current_time
+    
+    try:
+        range_name = f"{SHEET_NAME}!A{RANGE_START_ROW}:D"
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        users = []
+        
+        for idx, row in enumerate(values, start=RANGE_START_ROW):
+            if len(row) >= 2:  # At least EID and Name must be present
+                try:
+                    balance = float(row[COL_BALANCE].strip()) if len(row) > COL_BALANCE and row[COL_BALANCE].strip() else 0.0
+                except (ValueError, IndexError):
+                    balance = 0.0
+                
+                user = {
+                    "id": str(idx - RANGE_START_ROW + 1),  # Generate ID based on row
+                    "name": str(row[COL_NAME]).strip() if len(row) > COL_NAME else "",
+                    "rfidCardId": str(row[COL_EID]).strip() if len(row) > COL_EID else "",
+                    "balance": balance,
+                    "phoneNumber": str(row[COL_CONTACT]).strip() if len(row) > COL_CONTACT else "",
+                    "createdAt": "2024-01-01T00:00:00.000Z"  # Default timestamp
+                }
+                users.append(user)
+        
+        print(f"[SHEETS] ✓ Fetched {len(users)} users from Google Sheets")
+        return users
+        
+    except Exception as e:
+        print(f"[SHEETS] Error fetching users: {e}")
+        return []
+
+
+def write_user_to_sheets(card_id: str, card_text: str) -> bool:
+    """Write new user to Google Sheets (WRITE from Hardware to Sheet)"""
+    if not sheets_service:
+        return False
+    
+    try:
+        # First, fetch current users to find next row
+        range_name = f"{SHEET_NAME}!A{RANGE_START_ROW}:D"
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        next_row = len(values) + RANGE_START_ROW
+        
+        # Prepare new user data
+        new_user_data = [
+            str(card_id),           # EID (Column A)
+            str(card_text).strip(), # Name (Column B)
+            "",                     # Contact Number (Column C) - empty for now
+            "0"                     # Current Balance (Column D) - default to 0
+        ]
+        
+        range_name = f"{SHEET_NAME}!A{next_row}:D{next_row}"
+        
+        body = {'values': [new_user_data]}
+        
+        result = sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name,
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        
+        print(f"[SHEETS] ✓ Added new user to row {next_row}")
+        clear_user_cache()  # Clear cache to force refresh
+        return True
+        
+    except Exception as e:
+        print(f"[SHEETS] Error writing user: {e}")
+        return False
+
+
+def update_balance_in_sheets(card_id: str, new_balance: float) -> bool:
+    """Update user balance in Google Sheets"""
+    if not sheets_service:
+        return False
+    
+    try:
+        # Fetch users to find the row
+        range_name = f"{SHEET_NAME}!A{RANGE_START_ROW}:D"
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        # Find the user by card_id
+        for idx, row in enumerate(values, start=RANGE_START_ROW):
+            if len(row) > COL_EID and str(row[COL_EID]).strip() == str(card_id).strip():
+                # Found the user, update balance
+                balance_range = f"{SHEET_NAME}!D{idx}"
+                
+                body = {'values': [[str(new_balance)]]}
+                
+                result = sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=balance_range,
+                    valueInputOption='RAW',
+                    body=body
+                ).execute()
+                
+                print(f"[SHEETS] ✓ Updated balance for card {card_id} to ₹{new_balance:.2f}")
+                clear_user_cache()  # Clear cache to force refresh
+                return True
+        
+        print(f"[SHEETS] User with card ID {card_id} not found in sheet")
+        return False
+        
+    except Exception as e:
+        print(f"[SHEETS] Error updating balance: {e}")
+        return False
+
+
+def update_user_in_sheets(card_id: str, name: str = None, contact: str = None, rfid_card_id: str = None) -> bool:
+    """Update user information in Google Sheets (name, contact, or RFID card ID)"""
+    if not sheets_service:
+        return False
+    
+    try:
+        # Fetch users to find the row
+        range_name = f"{SHEET_NAME}!A{RANGE_START_ROW}:D"
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        # Find the user by card_id
+        for idx, row in enumerate(values, start=RANGE_START_ROW):
+            if len(row) > COL_EID and str(row[COL_EID]).strip() == str(card_id).strip():
+                # Found the user, update fields
+                updates = []
+                
+                # Update RFID Card ID (Column A) if provided
+                if rfid_card_id is not None:
+                    range_a = f"{SHEET_NAME}!A{idx}"
+                    body_a = {'values': [[str(rfid_card_id)]]}
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=range_a,
+                        valueInputOption='RAW',
+                        body=body_a
+                    ).execute()
+                    updates.append("RFID Card ID")
+                
+                # Update Name (Column B) if provided
+                if name is not None:
+                    range_b = f"{SHEET_NAME}!B{idx}"
+                    body_b = {'values': [[str(name)]]}
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=range_b,
+                        valueInputOption='RAW',
+                        body=body_b
+                    ).execute()
+                    updates.append("Name")
+                
+                # Update Contact (Column C) if provided
+                if contact is not None:
+                    range_c = f"{SHEET_NAME}!C{idx}"
+                    body_c = {'values': [[str(contact)]]}
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=range_c,
+                        valueInputOption='RAW',
+                        body=body_c
+                    ).execute()
+                    updates.append("Contact")
+                
+                if updates:
+                    print(f"[SHEETS] ✓ Updated {', '.join(updates)} for card {card_id}")
+                    clear_user_cache()  # Clear cache to force refresh
+                    return True
+        
+        print(f"[SHEETS] User with card ID {card_id} not found in sheet")
+        return False
+        
+    except Exception as e:
+        print(f"[SHEETS] Error updating user: {e}")
+        return False
+
+
+# ============================================================
+# USER MANAGEMENT FUNCTIONS
+# ============================================================
+
+def load_users(use_cache: bool = True, force_refresh: bool = False) -> list:
+    """Load users from Google Sheets. Uses cache if available and not forcing refresh."""
+    current_time = time.time()
+    
+    # Check cache first (unless forced refresh)
+    if use_cache and not force_refresh:
+        with user_cache["lock"]:
+            if (user_cache["data"] is not None and 
+                (current_time - user_cache["timestamp"]) < CACHE_EXPIRY_SECONDS):
+                return user_cache["data"].copy()
+    
+    # Try to load from Google Sheets first
+    if sheets_service:
+        users = fetch_users_from_sheets(force=force_refresh)
+        if users:
+            # Update cache
+            if use_cache:
+                with user_cache["lock"]:
+                    user_cache["data"] = users.copy()
+                    user_cache["timestamp"] = current_time
+            return users
+        # If fetch returned empty (due to polling interval), try to use cache anyway
+        if use_cache and not force_refresh:
+            with user_cache["lock"]:
+                if user_cache["data"] is not None:
+                    # Cache might be stale but better than nothing
+                    return user_cache["data"].copy()
+    
+    # Fallback: return empty list
+    # Note: In production, consider keeping a local backup file
+    if not sheets_service:
+        print("[WARNING] Google Sheets not available and no cached users. System may not function properly.")
+    return []
 
 
 def save_users(users: list):
-    """Save users to JSON file"""
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(users, f, indent=2)
-    except Exception as e:
-        print(f"[ERROR] Failed to save users: {e}")
+    """Save users - updates Google Sheets if available"""
+    if sheets_service:
+        # For bulk updates, we'd need to update each user individually
+        # For now, we'll update balances as they change
+        print("[INFO] Users are managed via Google Sheets. Individual updates will sync automatically.")
+    else:
+        print("[WARNING] Google Sheets not available. Users not persisted.")
+    
+    # Clear cache when data is saved
+    clear_user_cache()
 
 
 def get_user_by_rfid(rfid_id: str) -> Optional[Dict[str, Any]]:
-    """Find user by RFID card ID or by name (partial match)"""
+    """Find user by RFID card ID (exact match only for security)"""
     users = load_users()
     rfid_str = str(rfid_id).strip()
     
-    # First, try exact RFID match
+    # Only match by exact RFID card ID for security
     for user in users:
         if str(user.get("rfidCardId", "")).strip() == rfid_str:
-            return user
-    
-    # If no exact match, try to find by name (for cards that might have name stored)
-    # This allows matching "Lalit" to "Lalit Nikumbh"
-    rfid_lower = rfid_str.lower()
-    for user in users:
-        user_name = user.get("name", "").lower()
-        # Check if RFID string matches any part of the name
-        if rfid_lower in user_name or user_name.split()[0].lower() == rfid_lower:
-            print(f"[INFO] Matched RFID '{rfid_str}' to user '{user['name']}' by name")
-            return user
+            return user.copy()  # Return a copy to avoid modifying cached data
     
     return None
 
 
 def update_user_balance(user_id: str, new_balance: float):
-    """Update user balance"""
-    users = load_users()
+    """Update user balance - syncs with Google Sheets immediately"""
+    users = load_users(use_cache=False, force_refresh=True)  # Force refresh to get latest data
     for user in users:
         if user["id"] == user_id:
-            user["balance"] = max(0.0, new_balance)  # Ensure balance doesn't go negative
-            save_users(users)
+            old_balance = user["balance"]
+            new_balance = max(0.0, new_balance)  # Ensure balance doesn't go negative
+            
+            # Update in Google Sheets FIRST (source of truth)
+            if sheets_service:
+                success = update_balance_in_sheets(user["rfidCardId"], new_balance)
+                if not success:
+                    print(f"[WARNING] Failed to update balance in Google Sheets for user {user_id}")
+                    return False
+            else:
+                print("[WARNING] Google Sheets not available. Balance update not persisted.")
+            
+            # Update local cache after successful Sheets update
+            with user_cache["lock"]:
+                if user_cache["data"]:
+                    for cached_user in user_cache["data"]:
+                        if cached_user["id"] == user_id:
+                            cached_user["balance"] = new_balance
+                            break
+            
+            print(f"[INFO] Balance updated: {user['name']} - ₹{old_balance:.2f} → ₹{new_balance:.2f}")
             return True
     return False
 
+
+def clear_user_cache():
+    """Clear the user cache"""
+    with user_cache["lock"]:
+        user_cache["data"] = None
+        user_cache["timestamp"] = 0
+        print("[INFO] User cache cleared")
+
+
+def get_cache_info() -> Dict[str, Any]:
+    """Get cache information"""
+    with user_cache["lock"]:
+        current_time = time.time()
+        age = current_time - user_cache["timestamp"] if user_cache["timestamp"] > 0 else 0
+        is_valid = (user_cache["data"] is not None and 
+                   age < CACHE_EXPIRY_SECONDS)
+        
+        return {
+            "cached": user_cache["data"] is not None,
+            "age_seconds": round(age, 2),
+            "expiry_seconds": CACHE_EXPIRY_SECONDS,
+            "is_valid": is_valid,
+            "cache_size": len(user_cache["data"]) if user_cache["data"] else 0,
+            "google_sheets_enabled": sheets_service is not None
+        }
+
+
+# ============================================================
+# HARDWARE FUNCTIONS
+# ============================================================
 
 def init_hardware():
     """Initialize GPIO and RFID reader"""
@@ -271,9 +581,15 @@ def charging_monitor():
                 print("[INFO] Balance depleted - stopping charging")
                 stop_charging()
             else:
-                # Update balance in real-time
+                # Update balance in real-time (local cache only, sheets updated on stop)
                 user_id = charging_state["current_user"]["id"]
-                update_user_balance(user_id, current_balance)
+                # Update local cache only during charging
+                with user_cache["lock"]:
+                    if user_cache["data"]:
+                        for cached_user in user_cache["data"]:
+                            if cached_user["id"] == user_id:
+                                cached_user["balance"] = current_balance
+                                break
         
         time.sleep(1)  # Update every second
 
@@ -302,19 +618,38 @@ def continuous_rfid_reader():
             # New card detected
             last_rfid_read = rfid_id
             last_rfid_read_time = current_time
-            print(f"[INFO] RFID card detected: {rfid_id}")
+            print(f"[INFO] RFID card detected: {rfid_id} (Text: {text if text else 'N/A'})")
             
-            # Find user (by RFID ID or name)
+            # Find user (by RFID ID only - exact match required for security)
             user = get_user_by_rfid(rfid_id)
             
-            # Create and send event
+            # If user not found and Google Sheets is available, try to add as new user
+            if not user and sheets_service:
+                print(f"[INFO] New card detected. Adding to Google Sheets...")
+                if write_user_to_sheets(rfid_id, text if text else f"User_{rfid_id}"):
+                    # Reload users and find the newly added user
+                    clear_user_cache()
+                    user = get_user_by_rfid(rfid_id)
+                    if user:
+                        print(f"[INFO] New user added: {user['name']}")
+            
+            # Reload user to get latest balance if user found
+            if user:
+                users = load_users()
+                updated_user = next((u for u in users if u["id"] == user["id"]), user)
+                user = updated_user
+                print(f"[INFO] User found: {user['name']} - Balance: ₹{user['balance']:.2f}")
+            else:
+                print(f"[WARNING] RFID card {rfid_id} not registered")
+            
+            # Create and send event with user data
             event_data = {
                 "type": "rfid_detected",
                 "rfidCardId": rfid_id,
                 "timestamp": current_time,
                 "user": user,
                 "success": user is not None,
-                "error": None if user else "Card not registered"
+                "error": None if user else f"Card {rfid_id} not registered. Please contact admin."
             }
             
             try:
@@ -365,7 +700,9 @@ def continuous_rfid_reader():
                 print(f"[ERROR] RFID read error: {e}")
 
 
-# API Endpoints
+# ============================================================
+# API ENDPOINTS
+# ============================================================
 
 @app.route('/api/health', methods=['GET'])
 def health():
@@ -373,6 +710,7 @@ def health():
     return jsonify({
         "status": "ok",
         "hardware_available": HARDWARE_AVAILABLE,
+        "google_sheets_enabled": sheets_service is not None,
         "charging": charging_state["is_charging"]
     })
 
@@ -422,6 +760,20 @@ def scan_rfid():
         
         # Find user
         user = get_user_by_rfid(rfid_id)
+        
+        # If user not found and Google Sheets available, add as new user
+        if not user and sheets_service:
+            print(f"[INFO] New card detected. Adding to Google Sheets...")
+            if write_user_to_sheets(rfid_id, text if text else f"User_{rfid_id}"):
+                # Force refresh to get the newly added user
+                clear_user_cache()
+                users = fetch_users_from_sheets(force=True)
+                if users:
+                    with user_cache["lock"]:
+                        user_cache["data"] = users.copy()
+                        user_cache["timestamp"] = time.time()
+                user = get_user_by_rfid(rfid_id)
+        
         if not user:
             return jsonify({
                 "success": False,
@@ -479,8 +831,8 @@ def scan_rfid():
 
 @app.route('/api/users', methods=['GET'])
 def get_users():
-    """Get all users"""
-    users = load_users()
+    """Get all users from Google Sheets (uses cache for performance)"""
+    users = load_users(use_cache=True)  # Use cache for performance
     return jsonify(users)
 
 
@@ -505,7 +857,7 @@ def get_user_by_rfid_endpoint(rfid_id: str):
 
 @app.route('/api/users/<user_id>/balance', methods=['PUT'])
 def update_balance(user_id: str):
-    """Update user balance"""
+    """Update user balance - syncs to Google Sheets"""
     data = request.get_json()
     new_balance = data.get("balance")
     
@@ -513,10 +865,58 @@ def update_balance(user_id: str):
         return jsonify({"error": "Balance is required"}), 400
     
     if update_user_balance(user_id, float(new_balance)):
-        user = get_user_by_rfid(load_users()[int(user_id) - 1]["rfidCardId"])
-        return jsonify(user)
+        # Reload users and find the user by ID (force refresh to get latest from Google Sheets)
+        users = load_users(use_cache=False, force_refresh=True)
+        user = next((u for u in users if u["id"] == user_id), None)
+        if user:
+            return jsonify(user)
+        else:
+            return jsonify({"error": "User not found after update"}), 404
     else:
         return jsonify({"error": "User not found"}), 404
+
+
+@app.route('/api/users/<user_id>', methods=['PUT'])
+def update_user(user_id: str):
+    """Update user information (name, contact, RFID card ID) - syncs to Google Sheets immediately"""
+    data = request.get_json()
+    
+    users = load_users(use_cache=False, force_refresh=True)
+    user = next((u for u in users if u["id"] == user_id), None)
+    
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    # Get current values
+    current_card_id = user.get("rfidCardId", "")
+    
+    # Only update fields that are provided in the request
+    name = data.get("name") if "name" in data else None
+    contact = data.get("phoneNumber") if "phoneNumber" in data else None
+    rfid_card_id = data.get("rfidCardId") if "rfidCardId" in data else None
+    
+    # Update in Google Sheets FIRST (source of truth)
+    if sheets_service:
+        success = update_user_in_sheets(
+            card_id=current_card_id,
+            name=name,
+            contact=contact,
+            rfid_card_id=rfid_card_id
+        )
+        if not success:
+            return jsonify({"error": "Failed to update user in Google Sheets"}), 500
+    else:
+        return jsonify({"error": "Google Sheets not available"}), 503
+    
+    # Reload users to get updated data from Google Sheets
+    clear_user_cache()
+    users = load_users(use_cache=False, force_refresh=True)
+    updated_user = next((u for u in users if u["id"] == user_id), None)
+    
+    if updated_user:
+        return jsonify(updated_user)
+    else:
+        return jsonify({"error": "User not found after update"}), 404
 
 
 @app.route('/api/charging/status', methods=['GET'])
@@ -568,23 +968,108 @@ def start_charging_endpoint():
         return jsonify({"error": "Failed to start charging"}), 500
 
 
+@app.route('/api/cache/clear', methods=['POST'])
+def clear_cache_endpoint():
+    """Manually clear the user cache"""
+    clear_user_cache()
+    return jsonify({
+        "success": True,
+        "message": "Cache cleared successfully"
+    })
+
+
+@app.route('/api/cache/info', methods=['GET'])
+def cache_info_endpoint():
+    """Get cache information"""
+    return jsonify(get_cache_info())
+
+
+@app.route('/api/rfid/registered', methods=['GET'])
+def get_registered_rfid_cards():
+    """Get list of registered RFID cards"""
+    users = load_users()
+    registered_cards = [
+        {
+            "rfidCardId": user["rfidCardId"],
+            "name": user["name"],
+            "balance": user["balance"]
+        }
+        for user in users
+    ]
+    return jsonify({
+        "registeredCards": registered_cards,
+        "total": len(registered_cards)
+    })
+
+
+def cache_monitor():
+    """Background thread to monitor and auto-clear cache when threshold is reached"""
+    while True:
+        try:
+            cache_info = get_cache_info()
+            
+            # Auto-clear if cache is expired
+            if cache_info["cached"] and not cache_info["is_valid"]:
+                print(f"[INFO] Auto-clearing expired cache (age: {cache_info['age_seconds']:.2f}s)")
+                clear_user_cache()
+            
+            time.sleep(10)  # Check every 10 seconds
+        except Exception as e:
+            print(f"[ERROR] Cache monitor error: {e}")
+            time.sleep(10)
+
+
+def google_sheets_sync_monitor():
+    """Background thread to periodically sync with Google Sheets"""
+    while True:
+        try:
+            if sheets_service:
+                # Force refresh from Google Sheets every 30 seconds
+                print("[SHEETS] Periodic sync: Refreshing users from Google Sheets...")
+                users = fetch_users_from_sheets(force=True)
+                if users:
+                    with user_cache["lock"]:
+                        user_cache["data"] = users.copy()
+                        user_cache["timestamp"] = time.time()
+                    print(f"[SHEETS] ✓ Synced {len(users)} users from Google Sheets")
+            time.sleep(30)  # Sync every 30 seconds
+        except Exception as e:
+            print(f"[ERROR] Google Sheets sync monitor error: {e}")
+            time.sleep(30)
+
+
 def cleanup():
     """Cleanup GPIO on exit"""
     if HARDWARE_AVAILABLE:
         try:
             set_relay(False)
             GPIO.cleanup()
-        except:
-            pass
+        except Exception as e:
+            print(f"[WARNING] Cleanup error: {e}")
 
 
 if __name__ == '__main__':
+    # Initialize Google Sheets
+    print("[INFO] Initializing Google Sheets connection...")
+    init_google_sheets()
+    
     # Initialize hardware
     init_hardware()
     
     # Start charging monitor thread
     monitor_thread = threading.Thread(target=charging_monitor, daemon=True)
     monitor_thread.start()
+    
+    # Start cache monitor thread
+    cache_thread = threading.Thread(target=cache_monitor, daemon=True)
+    cache_thread.start()
+    print("[INFO] Cache monitor started")
+    
+    # Start Google Sheets sync monitor thread
+    if sheets_service:
+        sheets_sync_thread = threading.Thread(target=google_sheets_sync_monitor, daemon=True)
+        sheets_sync_thread.start()
+        print("[INFO] Google Sheets sync monitor started")
     
     # Start continuous RFID reading thread
     rfid_reading_active = True
@@ -597,6 +1082,7 @@ if __name__ == '__main__':
     def shutdown():
         global rfid_reading_active
         rfid_reading_active = False
+        clear_user_cache()
         cleanup()
     atexit.register(shutdown)
     
@@ -606,11 +1092,17 @@ if __name__ == '__main__':
     print(f"[INFO] API available at http://localhost:{port}/api")
     print(f"[INFO] Real-time RFID stream: http://localhost:{port}/api/rfid/stream")
     
+    # Print registered RFID cards
+    users = load_users()
+    print(f"[INFO] Registered RFID Cards ({len(users)}):")
+    for user in users:
+        print(f"  - {user['rfidCardId']} -> {user['name']} (Balance: ₹{user['balance']:.2f})")
+    
     try:
         app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...")
         rfid_reading_active = False
+        clear_user_cache()
         cleanup()
         sys.exit(0)
-

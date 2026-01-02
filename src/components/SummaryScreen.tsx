@@ -46,8 +46,8 @@ export default function SummaryScreen() {
   const handleSendMessage = async () => {
     if (!session) return;
 
-    // Get user phone number from database
-    const users = db.getUsers();
+    // Get user phone number from database (backend/Google Sheets)
+    const users = await db.getUsers().catch(() => db.getUsersSync());
     const user = users.find((u) => u.id === session.userId);
     
     if (!user?.phoneNumber) {
