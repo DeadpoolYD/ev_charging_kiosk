@@ -55,9 +55,9 @@ export default function CostSelectionScreen() {
     setProcessing(true);
 
     try {
-      // Deduct balance
+      // Deduct balance (syncs to Google Sheets via backend)
       const newBalance = currentUser.balance - selectedAmount;
-      db.updateUserBalance(currentUser.id, newBalance);
+      await db.updateUserBalance(currentUser.id, newBalance);
 
       // Create session
       const session: ChargingSession = {

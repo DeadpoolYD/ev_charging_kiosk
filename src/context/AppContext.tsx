@@ -59,8 +59,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const activeSession = db.getActiveSession();
     if (activeSession) {
       setCurrentSession(activeSession);
-      const user = db.getUsers().find((u) => u.id === activeSession.userId);
-      if (user) setCurrentUser(user);
+      // Load user from backend
+      const loadUser = async () => {
+        try {
+          const users = await db.getUsers();
+          const user = users.find((u) => u.id === activeSession.userId);
+          if (user) setCurrentUser(user);
+        } catch (error) {
+          // Fallback to sync version
+          const users = db.getUsersSync();
+          const user = users.find((u) => u.id === activeSession.userId);
+          if (user) setCurrentUser(user);
+        }
+      };
+      loadUser();
     }
 
     // Load settings

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { CreditCard, Battery, User, Wallet, RefreshCw, ChevronDown } from 'lucide-react';
 import { useApp } from '../context/AppContext';
@@ -15,8 +15,23 @@ export default function AuthScreen() {
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
   const [cardScanned, setCardScanned] = useState(false); // Track if card was actually scanned
   
-  // Memoize users list to prevent unnecessary re-renders
-  const users = useMemo(() => db.getUsers(), []);
+  // Users loaded from backend (Google Sheets)
+  const [users, setUsers] = useState<UserType[]>([]);
+  
+  useEffect(() => {
+    // Load users from backend on mount
+    const loadUsers = async () => {
+      try {
+        const loadedUsers = await db.getUsers();
+        setUsers(loadedUsers);
+      } catch (error) {
+        console.error('[AuthScreen] Failed to load users:', error);
+        // Fallback to sync version
+        setUsers(db.getUsersSync());
+      }
+    };
+    loadUsers();
+  }, []);
 
   const cleanupRef = useRef<(() => void) | null>(null);
   const backendCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
