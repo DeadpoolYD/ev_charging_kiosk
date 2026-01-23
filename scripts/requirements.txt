@@ -1,0 +1,21 @@
+# Python Requirements for RFID Verification
+# Install with: pip install -r requirements.txt
+
+# Supabase Python Client
+supabase>=2.0.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# HTTP Requests (for Next.js API communication)
+requests>=2.31.0
+
+# Raspberry Pi GPIO (only needed on Raspberry Pi)
+# RPi.GPIO>=0.7.1
+
+# RFID Reader Library (only needed on Raspberry Pi)
+# mfrc522>=0.0.7
+
+# Optional: For better error handling and logging
+# colorama>=0.4.6
+

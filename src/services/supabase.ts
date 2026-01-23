@@ -16,6 +16,19 @@ export const supabase: SupabaseClient | null = SUPABASE_URL && SUPABASE_ANON_KEY
 
 // Database table name
 export const USERS_TABLE = 'users';
+export const LOGS_TABLE = 'authentication_logs';
+
+// Authentication log interface
+export interface AuthenticationLog {
+  id: string;
+  user_id: string | null;
+  eid: string;
+  user_name: string | null;
+  event_type: 'login' | 'logout' | 'failed' | 'timeout';
+  success: boolean;
+  message: string | null;
+  created_at: string;
+}
 
 // Database user interface (matches Supabase table structure)
 export interface DatabaseUser {
@@ -273,6 +286,28 @@ export const supabaseService = {
     }
   },
 
+  // Update: Update user state by EID (for authentication)
+  async updateUserStateByEid(eid: string, state: boolean): Promise<boolean> {
+    if (!supabase) return false;
+
+    try {
+      const { error } = await supabase
+        .from(USERS_TABLE)
+        .update({ state })
+        .eq('eid', eid.trim());
+
+      if (error) {
+        console.error('[Supabase] Error updating state by EID:', error);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[Supabase] Exception updating state by EID:', error);
+      return false;
+    }
+  },
+
   // Delete: Delete user by EID
   async deleteUserByEid(eid: string): Promise<boolean> {
     if (!supabase) return false;
@@ -295,3 +330,159 @@ export const supabaseService = {
     }
   },
 };
+
+// Get recent authentication logs (login events only)
+export async function getRecentLoginLogs(limit: number = 10): Promise<AuthenticationLog[]> {
+  if (!supabase) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from(LOGS_TABLE)
+      .select('*')
+      .eq('event_type', 'login')
+      .eq('success', true)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error('[Supabase] Error fetching login logs:', error);
+      return [];
+    }
+
+    return (data || []) as AuthenticationLog[];
+  } catch (error) {
+    console.error('[Supabase] Exception fetching login logs:', error);
+    return [];
+  }
+}
+
+// Subscribe to real-time authentication log changes for specific EID
+export function subscribeToAuthenticationLogByEid(
+  eid: string,
+  callback: (log: AuthenticationLog) => void
+): () => void {
+  if (!supabase) {
+    console.warn('[Supabase] Client not initialized, cannot subscribe to logs');
+    return () => {};
+  }
+
+  // Subscribe to INSERT events on authentication_logs table for specific EID
+  const channel = supabase
+    .channel(`authentication-log-${eid}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: LOGS_TABLE,
+        filter: `eid=eq.${eid}`,
+      },
+      (payload) => {
+        const newLog = payload.new as AuthenticationLog;
+        // Only trigger for successful login events
+        if (newLog.success && newLog.event_type === 'login') {
+          console.log('[Supabase] Login detected for EID:', eid, 'User:', newLog.user_name);
+          callback(newLog);
+        }
+      }
+    )
+    .subscribe();
+
+  // Return unsubscribe function
+  return () => {
+    supabase?.removeChannel(channel);
+  };
+}
+
+// Subscribe to real-time authentication log changes
+export function subscribeToAuthenticationLogs(
+  callback: (log: AuthenticationLog) => void
+): () => void {
+  if (!supabase) {
+    console.warn('[Supabase] Client not initialized, cannot subscribe to logs');
+    return () => {};
+  }
+
+  // Subscribe to INSERT events on authentication_logs table (login events only)
+  const channel = supabase
+    .channel('authentication-logs')
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: LOGS_TABLE,
+        filter: 'event_type=eq.login',
+      },
+      (payload) => {
+        const newLog = payload.new as AuthenticationLog;
+        // Only show successful logins
+        if (newLog.success && newLog.event_type === 'login') {
+          console.log('[Supabase] New login log:', newLog.user_name, newLog.eid);
+          callback(newLog);
+        }
+      }
+    )
+    .subscribe();
+
+  // Return unsubscribe function
+  return () => {
+    supabase?.removeChannel(channel);
+  };
+}
+
+// Real-time subscription for user state changes
+export function subscribeToUserStateChanges(
+  callback: (user: DatabaseUser) => void
+): () => void {
+  if (!supabase) {
+    console.warn('[Supabase] Client not initialized, cannot subscribe to changes');
+    return () => {};
+  }
+
+  // Subscribe to changes in users table
+  const channel = supabase
+    .channel('users-state-changes')
+    .on(
+      'postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: USERS_TABLE,
+      },
+      (payload) => {
+        const updatedUser = payload.new as DatabaseUser;
+        console.log('[Supabase] User state changed:', updatedUser.eid, 'state:', updatedUser.state);
+        callback(updatedUser);
+      }
+    )
+    .subscribe();
+
+  // Return unsubscribe function
+  return () => {
+    supabase?.removeChannel(channel);
+  };
+}
+
+// Poll user state by EID (alternative to realtime)
+export async function pollUserStateByEid(eid: string): Promise<DatabaseUser | null> {
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from(USERS_TABLE)
+      .select('*')
+      .eq('eid', eid.trim())
+      .single();
+
+    if (error) {
+      console.error('[Supabase] Error polling user state:', error);
+      return null;
+    }
+
+    return data as DatabaseUser;
+  } catch (error) {
+    console.error('[Supabase] Exception polling user state:', error);
+    return null;
+  }
+}

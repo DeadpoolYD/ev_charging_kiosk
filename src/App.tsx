@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { AppProvider } from './context/AppContext';
 import AuthScreen from './components/AuthScreen';
+import UserDashboard from './components/UserDashboard';
 import CostSelectionScreen from './components/CostSelectionScreen';
 import ChargingScreen from './components/ChargingScreen';
 import SummaryScreen from './components/SummaryScreen';
@@ -12,6 +13,7 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<AuthScreen />} />
+          <Route path="/dashboard/:id" element={<UserDashboard />} />
           <Route path="/select-cost" element={<CostSelectionScreen />} />
           <Route path="/charging" element={<ChargingScreen />} />
           <Route path="/summary" element={<SummaryScreen />} />

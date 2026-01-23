@@ -106,6 +106,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     
     // If backend already returned the user, use it directly
     if (result.user) {
+      // Check if user is authenticated (state must be TRUE)
+      if (result.user.state === false) {
+        console.warn('[AppContext] User is not authenticated (state = FALSE)');
+        return null;
+      }
       setCurrentUser(result.user);
       return result.user;
     }
@@ -114,6 +119,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (result.rfidCardId) {
       const user = await db.getUserByRfid(result.rfidCardId);
       if (user) {
+        // Check if user is authenticated (state must be TRUE)
+        if (user.state === false) {
+          console.warn('[AppContext] User is not authenticated (state = FALSE)');
+          return null;
+        }
         setCurrentUser(user);
         return user;
       }

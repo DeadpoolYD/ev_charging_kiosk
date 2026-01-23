@@ -159,6 +159,15 @@ export const db = {
     }
   },
 
+  async updateUserState(rfidCardId: string, state: boolean): Promise<boolean> {
+    try {
+      return await supabaseService.updateUserStateByEid(rfidCardId, state);
+    } catch (error) {
+      console.error('[Database] Error updating user state:', error);
+      return false;
+    }
+  },
+
   async deleteUser(userId: string): Promise<boolean> {
     try {
       return await supabaseService.deleteUser(userId);

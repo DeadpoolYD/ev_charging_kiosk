@@ -305,7 +305,6 @@ class HardwareService {
     // Check if backend is available
     this.checkBackendAvailable().then((available) => {
       if (!available) {
-        console.warn('[Hardware] Backend not available, cannot start RFID event stream');
         return;
       }
 

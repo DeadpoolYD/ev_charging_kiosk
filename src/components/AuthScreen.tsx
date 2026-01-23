@@ -1,235 +1,335 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CreditCard, Battery, User as UserIcon, Wallet, RefreshCw, ChevronDown } from 'lucide-react';
-import { useApp } from '../context/AppContext';
+import { CreditCard, Play, Loader2, CheckCircle2, XCircle, User, Radio } from 'lucide-react';
+import { hardware } from '../services/hardware';
+import { getRecentLoginLogs, type AuthenticationLog } from '../services/supabase';
 import { db } from '../services/database';
-import { hardware, type RfidEvent } from '../services/hardware';
-import type { User } from '../types';
+import type { User as UserType } from '../types';
 
 export default function AuthScreen() {
   const navigate = useNavigate();
-  const { currentUser, setCurrentUser, scanRfid, batteryStatus, refreshBatteryStatus } = useApp();
-  const [scanning, setScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [showRfidSelector, setShowRfidSelector] = useState(false);
-  const [users, setUsers] = useState<User[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanTimeRemaining, setScanTimeRemaining] = useState(0);
+  const [detectedUser, setDetectedUser] = useState<{ name: string; eid: string; log: AuthenticationLog } | null>(null);
+  
+  const scanTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const scanIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const knownLogIdsRef = useRef<Set<string>>(new Set());
+  const scanStartTimeRef = useRef<number>(0);
 
+  // Initialize known log IDs on mount (for tracking new entries during scan)
   useEffect(() => {
-    const loadUsers = async () => {
-      const loadedUsers = await db.getUsers();
-      setUsers(loadedUsers);
+    const initializeLogTracking = async () => {
+      try {
+        const recentLogs = await getRecentLoginLogs(50);
+        // Initialize known log IDs to track new entries
+        knownLogIdsRef.current = new Set(recentLogs.map(log => log.id));
+      } catch (error) {
+        console.error('[AuthScreen] Error initializing log tracking:', error);
+      }
     };
-    loadUsers();
+
+    initializeLogTracking();
   }, []);
 
-  const cleanupRef = useRef<(() => void) | null>(null);
-
+  // Handle 7-second scan window
   useEffect(() => {
-    refreshBatteryStatus();
-
-    // Start listening for real-time RFID events
-    const cleanup = hardware.startRfidEventStream((event: RfidEvent) => {
-      console.log('[AuthScreen] RFID event:', event);
-
-      if (event.type === 'rfid_detected') {
-        if (event.success && event.user) {
-          // Valid user detected - update UI automatically
-          setCurrentUser(event.user);
-          setError(null);
-          setScanning(false);
-        } else {
-          // Invalid card
-          setError(event.error || 'RFID card not recognized. Please try again or contact admin.');
-          setScanning(false);
-        }
-      } else if (event.type === 'insufficient_balance') {
-        setError('Insufficient balance. Please recharge your account.');
-        setScanning(false);
+    if (!isScanning) {
+      // Clean up all intervals
+      if (scanTimeoutRef.current) {
+        clearTimeout(scanTimeoutRef.current);
+        scanTimeoutRef.current = null;
       }
-    });
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      if (scanIntervalRef.current) {
+        clearInterval(scanIntervalRef.current);
+        scanIntervalRef.current = null;
+      }
+      setScanTimeRemaining(0);
+      return;
+    }
 
-    cleanupRef.current = cleanup;
+    // Start 7-second countdown
+    setScanTimeRemaining(7);
+    scanStartTimeRef.current = Date.now();
+    
+    // Countdown timer
+    countdownIntervalRef.current = setInterval(() => {
+      setScanTimeRemaining((prev) => {
+        if (prev <= 1) {
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
 
-    // Cleanup on unmount
+    // Auto-stop after 7 seconds
+    scanTimeoutRef.current = setTimeout(() => {
+      setIsScanning(false);
+      setScanTimeRemaining(0);
+    }, 7000);
+
+    // Start RFID scanning
+    let isScanningActive = true;
+    scanIntervalRef.current = setInterval(async () => {
+      if (!isScanningActive) return;
+
+      try {
+        const result = await hardware.scanRfid();
+        if (result && result.rfidCardId) {
+          // Card detected - will be handled by polling
+        }
+      } catch (err) {
+        // Ignore scan errors
+      }
+    }, 500);
+
+    // Poll authentication_logs for new entries during scan window
+    pollIntervalRef.current = setInterval(async () => {
+      if (!isScanningActive) return;
+
+      try {
+        const recentLogs = await getRecentLoginLogs(50);
+        
+        // Find new login log that we haven't seen before
+        const newLog = recentLogs.find(
+          log => 
+            log.event_type === 'login' && 
+            log.success === true &&
+            log.user_name &&
+            !knownLogIdsRef.current.has(log.id) &&
+            new Date(log.created_at).getTime() >= scanStartTimeRef.current
+        );
+
+        if (newLog) {
+          // Found new entry - stop scanning and show confirmation
+          isScanningActive = false;
+          setIsScanning(false);
+          
+          // Add to known logs
+          knownLogIdsRef.current.add(newLog.id);
+          
+          // Show user name for confirmation
+          setDetectedUser({
+            name: newLog.user_name || 'Unknown User',
+            eid: newLog.eid,
+            log: newLog
+          });
+        }
+      } catch (err) {
+        console.error('[AuthScreen] Poll error:', err);
+      }
+    }, 500);
+
+    // Cleanup
     return () => {
-      if (cleanupRef.current) {
-        cleanupRef.current();
+      isScanningActive = false;
+      if (scanTimeoutRef.current) {
+        clearTimeout(scanTimeoutRef.current);
+        scanTimeoutRef.current = null;
+      }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      if (scanIntervalRef.current) {
+        clearInterval(scanIntervalRef.current);
+        scanIntervalRef.current = null;
       }
     };
-  }, [refreshBatteryStatus, setCurrentUser]);
+  }, [isScanning]);
 
-  const handleScan = async () => {
-    setScanning(true);
-    setError(null);
-    
+  const handleStartScan = () => {
+    setDetectedUser(null);
+    setIsScanning(true);
+  };
+
+  const handleStopScan = () => {
+    setIsScanning(false);
+    setScanTimeRemaining(0);
+    setDetectedUser(null);
+  };
+
+  const handleConfirmLogin = async () => {
+    if (!detectedUser) return;
+
     try {
-      const user = await scanRfid();
-      if (!user) {
-        setError('RFID card not recognized. Please try again or contact admin.');
+      // Get user data
+      const user = await db.getUserByRfid(detectedUser.eid);
+      if (user && detectedUser.log.user_id === user.id) {
+        // Redirect to dashboard
+        navigate(`/dashboard/${user.id}`, { state: { user } });
+      } else {
+        alert('User not found. Please try again.');
+        setDetectedUser(null);
       }
     } catch (err) {
-      setError('Failed to scan RFID card. Please try again.');
-    } finally {
-      setScanning(false);
+      console.error('[AuthScreen] Error confirming login:', err);
+      alert('Failed to authenticate. Please try again.');
+      setDetectedUser(null);
     }
   };
 
-  const handleProceed = () => {
-    if (currentUser) {
-      navigate('/select-cost');
-    }
-  };
-
-  const handleRecharge = () => {
-    navigate('/admin');
-  };
-
-  const handleLogout = () => {
-    setCurrentUser(null);
-    setError(null);
-    setShowRfidSelector(false);
-  };
-
-  const handleSelectRfid = (user: typeof users[0]) => {
-    setCurrentUser(user);
-    setShowRfidSelector(false);
-    setError(null);
+  const handleCancelLogin = () => {
+    setDetectedUser(null);
   };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-8">
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-20 h-20 bg-blue-100 rounded-full mb-4">
-            <CreditCard className="w-10 h-10 text-blue-600" />
+      <div className="w-full max-w-md">
+        {/* Main Card */}
+        <div className="bg-white rounded-3xl shadow-2xl p-8">
+          {/* Icon */}
+          <div className="flex justify-center mb-6">
+            <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center border-4 border-blue-200">
+              <CreditCard className="w-12 h-12 text-blue-600" />
+            </div>
           </div>
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">EV Charging Station</h1>
-          <p className="text-gray-600">Scan your RFID card to begin</p>
-          <p className="text-xs text-green-600 mt-1 flex items-center justify-center gap-1">
-            <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-            Real-time scanning active
+
+          {/* Title */}
+          <h1 className="text-3xl font-bold text-gray-900 text-center mb-2">
+            EV Charging Station
+          </h1>
+          
+          {/* Subtitle */}
+          <p className="text-gray-600 text-center mb-8">
+            Scan your RFID card to begin
           </p>
-        </div>
 
-        {!currentUser ? (
-          <div className="space-y-6">
-            <button
-              onClick={handleScan}
-              disabled={scanning}
-              className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-4 px-6 rounded-xl transition-all duration-200 flex items-center justify-center gap-3 shadow-lg"
-            >
-              {scanning ? (
-                <>
-                  <RefreshCw className="w-5 h-5 animate-spin" />
-                  Scanning...
-                </>
-              ) : (
-                <>
-                  <CreditCard className="w-5 h-5" />
-                  Scan RFID Card
-                </>
-              )}
-            </button>
+          {/* User Detected Display */}
+          {detectedUser ? (
+            <div className="text-center py-8">
+              {/* User Name - Big */}
+              <h2 className="text-5xl font-bold text-gray-900 mb-3">
+                {detectedUser.name}
+              </h2>
+              
+              {/* User Detected Label */}
+              <p className="text-lg text-gray-600 mb-8">User Detected</p>
 
-            <div className="relative">
-              <button
-                onClick={() => setShowRfidSelector(!showRfidSelector)}
-                className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-3 px-6 rounded-xl transition-all duration-200 flex items-center justify-center gap-2 border-2 border-gray-300"
-              >
-                <CreditCard className="w-5 h-5" />
-                Select RFID Card Manually
-                <ChevronDown className={`w-4 h-4 transition-transform ${showRfidSelector ? 'rotate-180' : ''}`} />
-              </button>
-
-              {showRfidSelector && (
-                <div className="absolute z-10 w-full mt-2 bg-white border-2 border-gray-200 rounded-xl shadow-lg max-h-60 overflow-y-auto">
-                  {users.map((user) => (
-                    <button
-                      key={user.id}
-                      onClick={() => handleSelectRfid(user)}
-                      className="w-full text-left px-4 py-3 hover:bg-blue-50 transition-colors border-b border-gray-100 last:border-b-0"
-                    >
-                      <div className="font-semibold text-gray-900">{user.name}</div>
-                      <div className="text-sm text-gray-600">RFID: {user.rfidCardId}</div>
-                      <div className="text-sm text-green-600 font-medium mt-1">Balance: ₹{user.balance.toFixed(2)}</div>
-                    </button>
-                  ))}
-                </div>
-              )}
+              {/* Action Buttons */}
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={handleConfirmLogin}
+                  className="w-full px-6 py-4 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold transition-all duration-200 shadow-lg hover:shadow-xl flex items-center justify-center gap-2"
+                >
+                  <CheckCircle2 className="w-5 h-5" />
+                  Confirm Login
+                </button>
+                <button
+                  onClick={handleCancelLogin}
+                  className="w-full px-6 py-4 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-xl font-semibold transition-all duration-200 flex items-center justify-center gap-2"
+                >
+                  <XCircle className="w-5 h-5" />
+                  Cancel
+                </button>
+              </div>
             </div>
-
-            {error && (
-              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
-                {error}
+          ) : isScanning ? (
+            <div className="text-center py-8">
+              {/* Scanning Status */}
+              <div className="flex items-center justify-center gap-2 mb-6">
+                <span className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></span>
+                <span className="text-green-600 font-medium">Real-time scanning active</span>
               </div>
-            )}
 
-            <div className="pt-4 border-t">
+              {/* Loading Animation */}
+              <div className="mb-6">
+                <Loader2 className="w-16 h-16 text-blue-600 animate-spin mx-auto mb-4" />
+                <p className="text-lg font-semibold text-gray-900 mb-2">
+                  Scanning for RFID card...
+                </p>
+                <p className="text-sm text-gray-600 mb-4">
+                  Time remaining: {scanTimeRemaining} seconds
+                </p>
+                
+                {/* Progress Bar */}
+                <div className="w-full bg-gray-200 rounded-full h-3 max-w-xs mx-auto">
+                  <div 
+                    className="bg-blue-600 h-3 rounded-full transition-all duration-1000"
+                    style={{ width: `${(scanTimeRemaining / 7) * 100}%` }}
+                  ></div>
+                </div>
+              </div>
+
+              {/* Instructions */}
+              <div className="bg-blue-50 rounded-xl p-4 mb-6">
+                <p className="text-sm text-gray-700 text-center">
+                  <span className="font-semibold">Instructions:</span> Place your RFID card near the reader and wait for detection.
+                </p>
+              </div>
+
+              {/* Stop Button */}
               <button
-                onClick={handleRecharge}
-                className="w-full text-blue-600 hover:text-blue-700 font-medium py-2"
+                onClick={handleStopScan}
+                className="w-full px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-xl font-semibold transition-all duration-200"
               >
-                Recharge Balance (Admin)
+                Stop Scan
               </button>
             </div>
-          </div>
-        ) : (
-          <div className="space-y-6">
-            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-6 space-y-4">
-              <div className="flex items-center gap-3">
-                <UserIcon className="w-5 h-5 text-gray-600" />
-                <div>
-                  <p className="text-sm text-gray-600">User Name</p>
-                  <p className="text-lg font-semibold text-gray-900">{currentUser.name}</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <Wallet className="w-5 h-5 text-gray-600" />
-                <div>
-                  <p className="text-sm text-gray-600">Current Balance</p>
-                  <p className="text-2xl font-bold text-green-600">₹{currentUser.balance.toFixed(2)}</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <Battery className="w-5 h-5 text-gray-600" />
-                <div>
-                  <p className="text-sm text-gray-600">Battery Level</p>
-                  <div className="flex items-center gap-2">
-                    <div className="flex-1 bg-gray-200 rounded-full h-3">
-                      <div
-                        className="bg-green-500 h-3 rounded-full transition-all"
-                        style={{ width: `${batteryStatus?.percentage || 0}%` }}
-                      />
-                    </div>
-                    <p className="text-lg font-semibold text-gray-900">
-                      {batteryStatus?.percentage.toFixed(0) || 0}%
-                    </p>
+          ) : (
+            <div className="text-center py-4">
+              {/* Instructions */}
+              <div className="bg-blue-50 rounded-xl p-6 mb-6">
+                <div className="flex items-start gap-3 mb-4">
+                  <Radio className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
+                  <div className="text-left">
+                    <p className="text-sm font-semibold text-gray-900 mb-2">How to scan:</p>
+                    <ol className="text-sm text-gray-700 space-y-1 list-decimal list-inside">
+                      <li>Click the "Scan RFID Card" button below</li>
+                      <li>Place your RFID card near the reader</li>
+                      <li>Wait for detection (7 seconds)</li>
+                      <li>Confirm your identity when detected</li>
+                    </ol>
                   </div>
                 </div>
               </div>
-            </div>
 
-            <div className="space-y-3">
+              {/* Start Scan Button */}
               <button
-                onClick={handleProceed}
-                className="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-4 px-6 rounded-xl transition-all duration-200 shadow-lg"
+                onClick={handleStartScan}
+                className="w-full px-6 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold transition-all duration-200 shadow-lg hover:shadow-xl flex items-center justify-center gap-3 text-lg"
               >
-                Proceed to Payment Selection
+                <CreditCard className="w-6 h-6" />
+                Scan RFID Card
               </button>
 
+              {/* Manual Selection Option */}
               <button
-                onClick={handleLogout}
-                className="w-full bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium py-3 px-6 rounded-xl transition-all duration-200"
+                onClick={() => navigate('/admin')}
+                className="w-full mt-3 px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl font-medium transition-all duration-200 flex items-center justify-center gap-2"
               >
-                Logout / Scan Another Card
+                <CreditCard className="w-5 h-5" />
+                Select RFID Card Manually
+                <span className="ml-auto">▼</span>
               </button>
             </div>
+          )}
+
+          {/* Admin Link */}
+          <div className="mt-8 pt-6 border-t border-gray-200">
+            <button
+              onClick={() => navigate('/admin')}
+              className="w-full text-center text-blue-600 hover:text-blue-700 font-medium text-sm transition-colors"
+            >
+              Recharge Balance (Admin)
+            </button>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
 }
-
