@@ -68,14 +68,19 @@ class HardwareService {
   }
 
   // RFID reader - calls Python backend
-  async scanRfid(): Promise<string | null> {
+  // Returns the full user object if successful, or null if failed
+  async scanRfid(): Promise<{ user: any; rfidCardId: string } | null> {
     const backendAvailable = await this.checkBackendAvailable();
     
     if (!backendAvailable) {
-      // Fallback to mock mode
+      // Fallback to mock mode - use a real EID from database
       console.warn('[Hardware] Python backend not available, using mock mode');
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      return 'RFID001';
+      // Return mock with real EID format
+      return { 
+        user: null, 
+        rfidCardId: '632589166397' // Lalit's EID from database
+      };
     }
 
     try {
@@ -100,8 +105,12 @@ class HardwareService {
         this.chargingActive = false;
       }
 
-      // Return RFID card ID
-      return data.user?.rfidCardId || null;
+      // Return both user object and RFID card ID
+      // The backend already found and validated the user
+      return {
+        user: data.user || null,
+        rfidCardId: data.user?.rfidCardId || null
+      };
     } catch (error) {
       console.error('[Hardware] RFID scan failed:', error);
       return null;

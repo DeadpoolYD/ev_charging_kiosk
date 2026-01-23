@@ -1,4 +1,5 @@
 import type { User, ChargingSession, SystemSettings, Transaction } from '../types';
+import { supabaseService } from './supabase';
 
 const STORAGE_KEYS = {
   USERS: 'ev_charging_users',
@@ -14,110 +15,157 @@ const DEFAULT_SETTINGS: SystemSettings = {
   defaultBatteryCapacity: 5000, // 5 kWh
 };
 
-// Initialize default users for demo
-const DEFAULT_USERS: User[] = [
-  {
-    id: '1',
-    name: 'Lalit Nikumbh',
-    rfidCardId: 'RFID001',
-    balance: 100.0,
-    phoneNumber: '+91 9876543212',
-    createdAt: new Date().toISOString(),
-  },
-  {
-    id: '2',
-    name: 'Fateen Shaikh',
-    rfidCardId: 'RFID002',
-    balance: 150.0,
-    phoneNumber: '+91 9876543213',
-    createdAt: new Date().toISOString(),
-  },
-  {
-    id: '3',
-    name: 'Nishad Deshmukh',
-    rfidCardId: 'RFID003',
-    balance: 90.0,
-    phoneNumber: '+91 9876543214',
-    createdAt: new Date().toISOString(),
-  },
-];
+// Note: Default users are now managed in Supabase database
 
 export const db = {
-  // Users
-  getUsers(): User[] {
-    const stored = localStorage.getItem(STORAGE_KEYS.USERS);
-    if (!stored) {
-      this.saveUsers(DEFAULT_USERS);
-      return DEFAULT_USERS;
+  // Users - Now using Supabase
+  async getUsers(): Promise<User[]> {
+    try {
+      const apiUsers = await supabaseService.getUsers();
+      // Convert APIUser to User format
+      return apiUsers.map((apiUser) => ({
+        id: apiUser.id,
+        name: apiUser.name,
+        rfidCardId: apiUser.rfidCardId,
+        balance: apiUser.balance,
+        phoneNumber: apiUser.phoneNumber,
+        state: apiUser.state,
+        createdAt: apiUser.createdAt,
+        updatedAt: apiUser.updatedAt,
+      }));
+    } catch (error) {
+      console.error('[Database] Error fetching users from Supabase:', error);
+      return [];
     }
-    const users = JSON.parse(stored);
-    
-    // Remove any traces of John Doe and Jane Smith (by name only)
-    const filteredUsers = users.filter(
-      (user: User) => 
-        user.name !== 'John Doe' && 
-        user.name !== 'Jane Smith'
-    );
-    
-    // Ensure we have all 3 required users
-    const requiredUserNames = ['Lalit Nikumbh', 'Fateen Shaikh', 'Nishad Deshmukh'];
-    const existingNames = filteredUsers.map((u: User) => u.name);
-    const missingUsers = DEFAULT_USERS.filter(
-      (defaultUser) => !existingNames.includes(defaultUser.name)
-    );
-    
-    // If users are missing, add them
-    if (missingUsers.length > 0) {
-      const mergedUsers = [...filteredUsers];
-      missingUsers.forEach((missingUser) => {
-        mergedUsers.push(missingUser);
+  },
+
+  // Synchronous version for backward compatibility (returns empty array, use async version)
+  getUsersSync(): User[] {
+    console.warn('[Database] getUsersSync() is deprecated. Use async getUsers() instead.');
+    return [];
+  },
+
+  async saveUsers(users: User[]): Promise<void> {
+    // This is a bulk operation - update each user
+    for (const user of users) {
+      try {
+        await supabaseService.updateUser(user.id, {
+          name: user.name,
+          rfidCardId: user.rfidCardId,
+          balance: user.balance,
+          phoneNumber: user.phoneNumber || '',
+          state: user.state ?? true,
+        });
+      } catch (error) {
+        console.error(`[Database] Error saving user ${user.id}:`, error);
+      }
+    }
+  },
+
+  async getUserByRfid(rfidCardId: string): Promise<User | null> {
+    try {
+      console.log('[Database] Looking up user by RFID:', rfidCardId);
+      const apiUser = await supabaseService.getUserByEid(rfidCardId);
+      if (!apiUser) {
+        console.log('[Database] User not found for RFID:', rfidCardId);
+        return null;
+      }
+      
+      const user = {
+        id: apiUser.id,
+        name: apiUser.name,
+        rfidCardId: apiUser.rfidCardId,
+        balance: apiUser.balance,
+        phoneNumber: apiUser.phoneNumber,
+        state: apiUser.state,
+        createdAt: apiUser.createdAt,
+        updatedAt: apiUser.updatedAt,
+      };
+      console.log('[Database] Found user:', user.name, 'Balance:', user.balance);
+      return user;
+    } catch (error) {
+      console.error('[Database] Error fetching user by RFID:', error);
+      return null;
+    }
+  },
+
+  // Synchronous version for backward compatibility (deprecated)
+  getUserByRfidSync(_rfidCardId: string): User | null {
+    console.warn('[Database] getUserByRfidSync() is deprecated. Use async getUserByRfid() instead.');
+    return null;
+  },
+
+  async updateUserBalance(userId: string, newBalance: number): Promise<void> {
+    try {
+      await supabaseService.updateUserBalance(userId, newBalance);
+    } catch (error) {
+      console.error('[Database] Error updating user balance:', error);
+    }
+  },
+
+  async addUser(user: Omit<User, 'id' | 'createdAt' | 'updatedAt'>): Promise<User | null> {
+    try {
+      const apiUser = await supabaseService.createUser({
+        name: user.name,
+        rfidCardId: user.rfidCardId,
+        balance: user.balance,
+        phoneNumber: user.phoneNumber || '',
+        state: user.state ?? true,
       });
-      this.saveUsers(mergedUsers);
-      return mergedUsers;
-    }
-    
-    // If we removed users, save the cleaned list
-    if (filteredUsers.length !== users.length) {
-      this.saveUsers(filteredUsers);
-      return filteredUsers;
-    }
-    
-    // If we have fewer than 3 users, restore defaults
-    if (filteredUsers.length < 3) {
-      this.saveUsers(DEFAULT_USERS);
-      return DEFAULT_USERS;
-    }
-    
-    return filteredUsers;
-  },
-
-  saveUsers(users: User[]): void {
-    localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-  },
-
-  // Force reset to default users (useful for admin)
-  resetUsers(): void {
-    this.saveUsers(DEFAULT_USERS);
-  },
-
-  getUserByRfid(rfidCardId: string): User | null {
-    const users = this.getUsers();
-    return users.find((u) => u.rfidCardId === rfidCardId) || null;
-  },
-
-  updateUserBalance(userId: string, newBalance: number): void {
-    const users = this.getUsers();
-    const user = users.find((u) => u.id === userId);
-    if (user) {
-      user.balance = newBalance;
-      this.saveUsers(users);
+      
+      if (!apiUser) return null;
+      
+      return {
+        id: apiUser.id,
+        name: apiUser.name,
+        rfidCardId: apiUser.rfidCardId,
+        balance: apiUser.balance,
+        phoneNumber: apiUser.phoneNumber,
+        state: apiUser.state,
+        createdAt: apiUser.createdAt,
+        updatedAt: apiUser.updatedAt,
+      };
+    } catch (error) {
+      console.error('[Database] Error adding user:', error);
+      return null;
     }
   },
 
-  addUser(user: User): void {
-    const users = this.getUsers();
-    users.push(user);
-    this.saveUsers(users);
+  async updateUser(userId: string, updates: Partial<User>): Promise<User | null> {
+    try {
+      const apiUser = await supabaseService.updateUser(userId, {
+        name: updates.name,
+        rfidCardId: updates.rfidCardId,
+        balance: updates.balance,
+        phoneNumber: updates.phoneNumber,
+        state: updates.state,
+      });
+      
+      if (!apiUser) return null;
+      
+      return {
+        id: apiUser.id,
+        name: apiUser.name,
+        rfidCardId: apiUser.rfidCardId,
+        balance: apiUser.balance,
+        phoneNumber: apiUser.phoneNumber,
+        state: apiUser.state,
+        createdAt: apiUser.createdAt,
+        updatedAt: apiUser.updatedAt,
+      };
+    } catch (error) {
+      console.error('[Database] Error updating user:', error);
+      return null;
+    }
+  },
+
+  async deleteUser(userId: string): Promise<boolean> {
+    try {
+      return await supabaseService.deleteUser(userId);
+    } catch (error) {
+      console.error('[Database] Error deleting user:', error);
+      return false;
+    }
   },
 
   // Sessions

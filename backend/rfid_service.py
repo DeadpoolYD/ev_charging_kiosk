@@ -15,6 +15,24 @@ from typing import Optional, Dict, Any
 from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 
+# Import Supabase database helper
+try:
+    from supabase_db import (
+        load_users as supabase_load_users,
+        get_user_by_eid,
+        get_user_by_name,
+        get_user_by_id,
+        update_user_balance_by_id,
+        update_user_balance as supabase_update_user_balance,
+        convert_to_api_format,
+        convert_from_api_format,
+        create_user
+    )
+    SUPABASE_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARNING] Supabase not available: {e}")
+    SUPABASE_AVAILABLE = False
+
 # Try to import hardware libraries (will fail gracefully if not on Raspberry Pi)
 try:
     import RPi.GPIO as GPIO
@@ -52,7 +70,6 @@ except ImportError:
 # Configuration
 RELAY_PIN = 18  # GPIO pin for relay control (BCM numbering)
 RFID_READER = None
-DATA_FILE = Path(__file__).parent / "users_data.json"
 CHARGING_RATE_PER_SECOND = 0.01  # Balance deduction per second while charging (₹0.01/sec = ₹36/hour)
 
 # Flask app setup
@@ -75,98 +92,83 @@ last_rfid_read = None
 last_rfid_read_time = 0
 RFID_DEBOUNCE_SECONDS = 3  # Ignore same card for 3 seconds
 
-# Default users (Lait, Nishad, Fateen)
-DEFAULT_USERS = [
+# Default users (Lalit, Nishad, Fateen) - for initialization if Supabase is empty
+DEFAULT_USERS_DB = [
     {
-        "id": "1",
-        "name": "Lalit Nikumbh",
-        "rfidCardId": "632589166397",
-        "balance": 100.0,
-        "phoneNumber": "+91 9876543212",
-        "createdAt": "2024-01-01T00:00:00.000Z"
+        "eid": "632589166397",
+        "name": "Lalit",
+        "contact_number": "1234567890",
+        "current_balance": 110.0,
+        "state": True
     },
     {
-        "id": "2",
-        "name": "Fateen Shaikh",
-        "rfidCardId": "RFID002",
-        "balance": 150.0,
-        "phoneNumber": "+91 9876543213",
-        "createdAt": "2024-01-01T00:00:00.000Z"
+        "eid": "535830005069",
+        "name": "Nishad",
+        "contact_number": "1234567890",
+        "current_balance": 150.0,
+        "state": True
     },
     {
-        "id": "3",
-        "name": "Nishad Deshmukh",
-        "rfidCardId": "RFID003",
-        "balance": 90.0,
-        "phoneNumber": "+91 9876543214",
-        "createdAt": "2024-01-01T00:00:00.000Z"
+        "eid": "85525041880",
+        "name": "Fateen",
+        "contact_number": "1234567890",
+        "current_balance": 100.0,
+        "state": True
     }
 ]
 
 
 def load_users() -> list:
-    """Load users from JSON file, create default if not exists"""
-    if DATA_FILE.exists():
-        try:
-            with open(DATA_FILE, 'r') as f:
-                users = json.load(f)
-                # Ensure we have all 3 required users
-                required_names = ["Lalit Nikumbh", "Fateen Shaikh", "Nishad Deshmukh"]
-                existing_names = [u["name"] for u in users]
-                missing = [u for u in DEFAULT_USERS if u["name"] not in existing_names]
-                if missing:
-                    users.extend(missing)
-                    save_users(users)
-                return users
-        except Exception as e:
-            print(f"[ERROR] Failed to load users: {e}")
-            return DEFAULT_USERS.copy()
-    else:
-        save_users(DEFAULT_USERS)
-        return DEFAULT_USERS.copy()
-
-
-def save_users(users: list):
-    """Save users to JSON file"""
+    """Load users from Supabase"""
+    if not SUPABASE_AVAILABLE:
+        print("[ERROR] Supabase not available")
+        return []
+    
     try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(users, f, indent=2)
+        db_users = supabase_load_users()
+        
+        # If database is empty, initialize with default users
+        if not db_users:
+            print("[INFO] Database empty, initializing with default users...")
+            for user_data in DEFAULT_USERS_DB:
+                create_user(user_data)
+            db_users = supabase_load_users()
+        
+        # Convert to API format
+        return [convert_to_api_format(user) for user in db_users]
     except Exception as e:
-        print(f"[ERROR] Failed to save users: {e}")
+        print(f"[ERROR] Failed to load users from Supabase: {e}")
+        return []
 
 
 def get_user_by_rfid(rfid_id: str) -> Optional[Dict[str, Any]]:
-    """Find user by RFID card ID or by name (partial match)"""
-    users = load_users()
+    """Find user by RFID card ID (EID) or by name (partial match)"""
+    if not SUPABASE_AVAILABLE:
+        return None
+    
     rfid_str = str(rfid_id).strip()
     
-    # First, try exact RFID match
-    for user in users:
-        if str(user.get("rfidCardId", "")).strip() == rfid_str:
-            return user
+    # First, try exact EID match
+    db_user = get_user_by_eid(rfid_str)
+    if db_user:
+        return convert_to_api_format(db_user)
     
     # If no exact match, try to find by name (for cards that might have name stored)
-    # This allows matching "Lalit" to "Lalit Nikumbh"
-    rfid_lower = rfid_str.lower()
-    for user in users:
-        user_name = user.get("name", "").lower()
-        # Check if RFID string matches any part of the name
-        if rfid_lower in user_name or user_name.split()[0].lower() == rfid_lower:
-            print(f"[INFO] Matched RFID '{rfid_str}' to user '{user['name']}' by name")
-            return user
+    # This allows matching "Lalit" to "Lalit"
+    db_user = get_user_by_name(rfid_str)
+    if db_user:
+        print(f"[INFO] Matched RFID '{rfid_str}' to user '{db_user.get('name')}' by name")
+        return convert_to_api_format(db_user)
     
     return None
 
 
 def update_user_balance(user_id: str, new_balance: float):
-    """Update user balance"""
-    users = load_users()
-    for user in users:
-        if user["id"] == user_id:
-            user["balance"] = max(0.0, new_balance)  # Ensure balance doesn't go negative
-            save_users(users)
-            return True
-    return False
+    """Update user balance by user ID"""
+    if not SUPABASE_AVAILABLE:
+        return False
+    
+    return update_user_balance_by_id(user_id, new_balance)
 
 
 def init_hardware():
@@ -272,8 +274,17 @@ def charging_monitor():
                 stop_charging()
             else:
                 # Update balance in real-time
-                user_id = charging_state["current_user"]["id"]
-                update_user_balance(user_id, current_balance)
+                user = charging_state["current_user"]
+                if user:
+                    # Update by EID (rfidCardId) for more reliable updates
+                    if SUPABASE_AVAILABLE:
+                        supabase_update_user_balance(user["rfidCardId"], current_balance)
+                        # Reload user to get updated data
+                        updated_user = get_user_by_rfid(user["rfidCardId"])
+                        if updated_user:
+                            charging_state["current_user"] = updated_user
+                    else:
+                        update_user_balance(user["id"], current_balance)
         
         time.sleep(1)  # Update every second
 
@@ -487,11 +498,18 @@ def get_users():
 @app.route('/api/users/<user_id>', methods=['GET'])
 def get_user(user_id: str):
     """Get user by ID"""
-    users = load_users()
-    user = next((u for u in users if u["id"] == user_id), None)
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify(user)
+    if SUPABASE_AVAILABLE:
+        db_user = get_user_by_id(user_id)
+        if db_user:
+            user = convert_to_api_format(db_user)
+            return jsonify(user)
+    else:
+        users = load_users()
+        user = next((u for u in users if u["id"] == user_id), None)
+        if user:
+            return jsonify(user)
+    
+    return jsonify({"error": "User not found"}), 404
 
 
 @app.route('/api/users/rfid/<rfid_id>', methods=['GET'])
@@ -513,7 +531,16 @@ def update_balance(user_id: str):
         return jsonify({"error": "Balance is required"}), 400
     
     if update_user_balance(user_id, float(new_balance)):
-        user = get_user_by_rfid(load_users()[int(user_id) - 1]["rfidCardId"])
+        # Get updated user
+        db_user = get_user_by_id(user_id) if SUPABASE_AVAILABLE else None
+        if db_user:
+            user = convert_to_api_format(db_user)
+        else:
+            # Fallback: find user in loaded users
+            users = load_users()
+            user = next((u for u in users if u["id"] == user_id), None)
+            if not user:
+                return jsonify({"error": "User not found"}), 404
         return jsonify(user)
     else:
         return jsonify({"error": "User not found"}), 404

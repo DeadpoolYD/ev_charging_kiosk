@@ -56,18 +56,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     // Load active session on mount
-    const activeSession = db.getActiveSession();
-    if (activeSession) {
-      setCurrentSession(activeSession);
-      const user = db.getUsers().find((u) => u.id === activeSession.userId);
-      if (user) setCurrentUser(user);
-    }
+    const loadData = async () => {
+      const activeSession = db.getActiveSession();
+      if (activeSession) {
+        setCurrentSession(activeSession);
+        const users = await db.getUsers();
+        const user = users.find((u) => u.id === activeSession.userId);
+        if (user) setCurrentUser(user);
+      }
 
-    // Load settings
-    setSettings(db.getSettings());
+      // Load settings
+      setSettings(db.getSettings());
 
-    // Initial battery status
-    refreshBatteryStatus();
+      // Initial battery status
+      refreshBatteryStatus();
+    };
+    loadData();
   }, [refreshBatteryStatus]);
 
   // Update battery status periodically
@@ -97,14 +101,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [currentSession, batteryStatus, refreshBatteryStatus, stopCharging]);
 
   const scanRfid = useCallback(async (): Promise<User | null> => {
-    const rfidCardId = await hardware.scanRfid();
-    if (!rfidCardId) return null;
+    const result = await hardware.scanRfid();
+    if (!result) return null;
     
-    const user = db.getUserByRfid(rfidCardId);
-    if (user) {
-      setCurrentUser(user);
-      return user;
+    // If backend already returned the user, use it directly
+    if (result.user) {
+      setCurrentUser(result.user);
+      return result.user;
     }
+    
+    // Otherwise, look up by RFID card ID (fallback for mock mode)
+    if (result.rfidCardId) {
+      const user = await db.getUserByRfid(result.rfidCardId);
+      if (user) {
+        setCurrentUser(user);
+        return user;
+      }
+    }
+    
     return null;
   }, []);
 

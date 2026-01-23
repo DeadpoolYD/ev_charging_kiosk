@@ -47,7 +47,7 @@ export default function SummaryScreen() {
     if (!session) return;
 
     // Get user phone number from database
-    const users = db.getUsers();
+    const users = await db.getUsers();
     const user = users.find((u) => u.id === session.userId);
     
     if (!user?.phoneNumber) {

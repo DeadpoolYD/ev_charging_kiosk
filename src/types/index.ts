@@ -4,7 +4,9 @@ export interface User {
   rfidCardId: string;
   balance: number;
   phoneNumber?: string; // Optional phone number for SMS notifications
+  state?: boolean; // Active/Inactive state (matches database)
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface ChargingSession {
