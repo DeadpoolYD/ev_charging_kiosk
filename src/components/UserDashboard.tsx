@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { User, Wallet, Phone, CreditCard, ArrowLeft } from 'lucide-react';
 import { db } from '../services/database';
 import type { User as UserType } from '../types';
+import type { AuthenticationLog } from '../services/supabase';
+import { getLoginLogsByUserId } from '../services/supabase';
+import { checkThingSpeakOnline } from '../services/thingspeak';
 
 export default function UserDashboard() {
   const { id } = useParams<{ id: string }>();
@@ -10,6 +13,9 @@ export default function UserDashboard() {
   const location = useLocation();
   const [user, setUser] = useState<UserType | null>(location.state?.user || null);
   const [loading, setLoading] = useState(!user);
+  const [loginLogs, setLoginLogs] = useState<AuthenticationLog[]>([]);
+  const isFetchingLogsRef = useRef(false);
+  const [iotOnline, setIotOnline] = useState<boolean | null>(null);
 
   useEffect(() => {
     const loadUser = async () => {
@@ -45,6 +51,76 @@ export default function UserDashboard() {
     loadUser();
   }, [id, navigate, location.state]);
 
+  // Check IoT / ThingSpeak status and poll periodically
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkStatus = async () => {
+      const { online } = await checkThingSpeakOnline(15);
+      if (!cancelled) {
+        setIotOnline(online);
+      }
+    };
+
+    checkStatus();
+    const intervalId = window.setInterval(checkStatus, 15000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  // Load and poll recent login logs for this user
+  useEffect(() => {
+    if (!user) return;
+
+    let isMounted = true;
+    const knownIds = new Set<string>();
+
+    const loadLogs = async () => {
+      if (isFetchingLogsRef.current) return;
+      isFetchingLogsRef.current = true;
+
+      try {
+        const logs = await getLoginLogsByUserId(user.id, 10);
+        if (!isMounted) return;
+
+        setLoginLogs((prev) => {
+          const existingIds = new Set(prev.map((l) => l.id));
+          const merged = [...prev];
+
+          for (const log of logs) {
+            if (!existingIds.has(log.id)) {
+              merged.push(log);
+            }
+            knownIds.add(log.id);
+          }
+
+          merged.sort(
+            (a, b) =>
+              new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+          );
+
+          return merged.slice(0, 10);
+        });
+      } catch (error) {
+        console.error('[UserDashboard] Error loading login logs:', error);
+      } finally {
+        isFetchingLogsRef.current = false;
+      }
+    };
+
+    // Initial load
+    loadLogs();
+    const intervalId = window.setInterval(loadLogs, 3000);
+
+    return () => {
+      isMounted = false;
+      window.clearInterval(intervalId);
+    };
+  }, [user]);
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center">
@@ -79,18 +155,34 @@ export default function UserDashboard() {
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div className="bg-white rounded-lg shadow-xl p-6 mb-6">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-4">
             <div>
               <h1 className="text-3xl font-bold text-gray-800">{user.name}'s Dashboard</h1>
               <p className="text-gray-600 mt-1">Welcome back</p>
             </div>
-            <button
-              onClick={() => navigate('/')}
-              className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition flex items-center gap-2"
-            >
-              <ArrowLeft className="w-4 h-4" />
-              Back
-            </button>
+            <div className="flex items-center gap-3">
+              {iotOnline !== null && (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold ${
+                    iotOnline ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      iotOnline ? 'bg-green-500' : 'bg-red-500'
+                    }`}
+                  ></span>
+                  <span>{iotOnline ? 'IoT Online' : 'IoT Offline'}</span>
+                </div>
+              )}
+              <button
+                onClick={() => navigate('/')}
+                className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition flex items-center gap-2"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                Back
+              </button>
+            </div>
           </div>
         </div>
 
@@ -165,13 +257,53 @@ export default function UserDashboard() {
           </div>
         </div>
 
+        {/* Recent Login Activity */}
+        {loginLogs.length > 0 && (
+          <div className="bg-white rounded-lg shadow-xl p-6 mb-6">
+            <h3 className="text-xl font-bold text-gray-800 mb-4">Recent Login Activity</h3>
+            <ul className="space-y-2 max-h-48 overflow-y-auto">
+              {loginLogs.map((log) => (
+                <li
+                  key={log.id}
+                  className="flex items-center justify-between text-sm text-gray-700"
+                >
+                  <span>
+                    {new Date(log.created_at).toLocaleString()}
+                  </span>
+                  <span className="font-medium text-green-600">
+                    Successful login
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* Actions */}
         <div className="bg-white rounded-lg shadow-xl p-6">
           <h3 className="text-xl font-bold text-gray-800 mb-4">Quick Actions</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <button
-              onClick={() => navigate('/select-cost', { state: { user } })}
-              className="px-4 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition font-medium"
+              onClick={async () => {
+                // Do not proceed if IoT system is offline
+                if (iotOnline === false) {
+                  alert('IoT system is offline. Please check the hardware connection before starting a charging session.');
+                  return;
+                }
+
+                // If status is unknown, double-check before proceeding
+                if (iotOnline === null) {
+                  const { online } = await checkThingSpeakOnline(15);
+                  if (!online) {
+                    alert('IoT system is offline. Please check the hardware connection before starting a charging session.');
+                    return;
+                  }
+                }
+
+                navigate('/select-cost', { state: { user } });
+              }}
+              className="px-4 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition font-medium disabled:opacity-60 disabled:cursor-not-allowed"
+              disabled={iotOnline === false}
             >
               Start Charging Session
             </button>

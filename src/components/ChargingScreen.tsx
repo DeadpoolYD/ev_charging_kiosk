@@ -1,15 +1,21 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Zap, Clock, AlertTriangle, StopCircle } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { db } from '../services/database';
 import { hardware } from '../services/hardware';
+import { fetchLatestThingSpeakReading } from '../services/thingspeak';
 
 export default function ChargingScreen() {
   const navigate = useNavigate();
   const { currentSession, setCurrentSession, batteryStatus } = useApp();
   const [elapsedTime, setElapsedTime] = useState(0);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
+  const [sensorVoltage, setSensorVoltage] = useState<number | null>(null);
+  const [sensorCurrent, setSensorCurrent] = useState<number | null>(null);
+  const [sensorPower, setSensorPower] = useState<number | null>(null);
+  const [sensorEnergyWh, setSensorEnergyWh] = useState(0);
+  const lastSampleTimeRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!currentSession) {
@@ -31,6 +37,43 @@ export default function ChargingScreen() {
 
     return () => clearInterval(interval);
   }, [currentSession, navigate]);
+
+  // Poll real sensor data from ThingSpeak
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadOnce = async () => {
+      const reading = await fetchLatestThingSpeakReading();
+      if (!isMounted || !reading) return;
+
+      const voltage = reading.voltage;
+      const current = reading.current;
+      const power = Math.max(0, voltage * current);
+
+      const now = Date.now();
+      const last = lastSampleTimeRef.current ?? now;
+      const dtSeconds = (now - last) / 1000;
+      lastSampleTimeRef.current = now;
+
+      // Integrate power over time to estimate energy (Wh)
+      if (!Number.isNaN(power) && dtSeconds > 0) {
+        setSensorEnergyWh((prev) => prev + power * (dtSeconds / 3600));
+      }
+
+      setSensorVoltage(voltage);
+      setSensorCurrent(current);
+      setSensorPower(power);
+    };
+
+    // Initial fetch and then poll every 5 seconds
+    loadOnce();
+    const intervalId = window.setInterval(loadOnce, 5000);
+
+    return () => {
+      isMounted = false;
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   const formatTime = (seconds: number): string => {
     const hours = Math.floor(seconds / 3600);
@@ -74,6 +117,17 @@ export default function ChargingScreen() {
   const startBattery = currentSession.startBattery;
   const targetBattery = currentSession.targetBattery;
   const energyKWh = (currentSession.energyDelivered || 0) / 1000;
+  const displayEnergyKWh = sensorEnergyWh > 0 ? sensorEnergyWh / 1000 : energyKWh;
+
+  // Prefer real ThingSpeak data when available; fallback to simulated batteryStatus
+  const displayVoltage = sensorVoltage ?? batteryStatus?.voltage ?? 0;
+  const displayCurrent = sensorCurrent ?? batteryStatus?.current ?? 0;
+  const displayPower =
+    sensorPower ??
+    batteryStatus?.power ??
+    (sensorVoltage !== null && sensorCurrent !== null
+      ? (sensorVoltage || 0) * (sensorCurrent || 0)
+      : 0);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-yellow-50 to-orange-100 flex items-center justify-center p-4">
@@ -144,7 +198,9 @@ export default function ChargingScreen() {
             <div className="grid grid-cols-2 gap-4 mt-6">
               <div className="bg-white rounded-lg p-4">
                 <div className="text-sm text-gray-600 mb-1">Energy Delivered</div>
-                <div className="text-xl font-bold text-gray-900">{energyKWh.toFixed(2)} kWh</div>
+              <div className="text-xl font-bold text-gray-900">
+                {displayEnergyKWh.toFixed(3)} kWh
+              </div>
               </div>
               <div className="bg-white rounded-lg p-4">
                 <div className="text-sm text-gray-600 mb-1">Remaining Balance</div>
@@ -156,15 +212,21 @@ export default function ChargingScreen() {
           <div className="grid grid-cols-3 gap-4">
             <div className="bg-gray-50 rounded-lg p-4 text-center">
               <div className="text-sm text-gray-600 mb-1">Voltage</div>
-              <div className="text-lg font-bold text-gray-900">{batteryStatus?.voltage.toFixed(1) || 0} V</div>
+              <div className="text-lg font-bold text-gray-900">
+                {Math.abs(displayVoltage).toFixed(1)} V
+              </div>
             </div>
             <div className="bg-gray-50 rounded-lg p-4 text-center">
               <div className="text-sm text-gray-600 mb-1">Current</div>
-              <div className="text-lg font-bold text-gray-900">{batteryStatus?.current.toFixed(1) || 0} A</div>
+              <div className="text-lg font-bold text-gray-900">
+                {Math.abs(displayCurrent).toFixed(1)} A
+              </div>
             </div>
             <div className="bg-gray-50 rounded-lg p-4 text-center">
               <div className="text-sm text-gray-600 mb-1">Power</div>
-              <div className="text-lg font-bold text-gray-900">{batteryStatus?.power || 0} W</div>
+              <div className="text-lg font-bold text-gray-900">
+                {Math.max(0, displayPower).toFixed(0)} W
+              </div>
             </div>
           </div>
 

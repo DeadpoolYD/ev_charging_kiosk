@@ -1,4 +1,4 @@
-# Frontend Supabase Integration Guide
+[# Frontend Supabase Integration Guide
 
 This guide explains how the frontend integrates with Supabase for CRUD operations on the users table.
 
@@ -250,3 +250,4 @@ If you're migrating from localStorage:
 - Supabase Docs: https://supabase.com/docs
 - Supabase Discord: https://discord.supabase.com
 - Project Issues: Check your project's issue tracker
+]

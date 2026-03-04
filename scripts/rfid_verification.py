@@ -51,6 +51,14 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Verify Supabase connection once on startup
+try:
+    supabase.table(USERS_TABLE).select("id").limit(1).execute()
+    print("it connected")
+except Exception as e:
+    print(f"[ERROR] Failed to connect to Supabase: {e}")
+    sys.exit(1)
+
 # Initialize RFID reader (if on Raspberry Pi)
 reader = None
 if RASPBERRY_PI:

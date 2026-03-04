@@ -16,6 +16,9 @@ requests>=2.31.0
 # RFID Reader Library (only needed on Raspberry Pi)
 # mfrc522>=0.0.7
 
+# UART Power Monitor (Raspberry Pi master for Arduino Nano)
+pyserial>=3.5
+
 # Optional: For better error handling and logging
 # colorama>=0.4.6
 

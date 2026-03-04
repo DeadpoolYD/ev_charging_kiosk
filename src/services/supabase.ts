@@ -356,6 +356,35 @@ export async function getRecentLoginLogs(limit: number = 10): Promise<Authentica
   }
 }
 
+// Get recent login logs for a specific user (by user_id)
+export async function getLoginLogsByUserId(
+  userId: string,
+  limit: number = 10
+): Promise<AuthenticationLog[]> {
+  if (!supabase) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from(LOGS_TABLE)
+      .select('*')
+      .eq('user_id', userId)
+      .eq('event_type', 'login')
+      .eq('success', true)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error('[Supabase] Error fetching user login logs:', error);
+      return [];
+    }
+
+    return (data || []) as AuthenticationLog[];
+  } catch (error) {
+    console.error('[Supabase] Exception fetching user login logs:', error);
+    return [];
+  }
+}
+
 // Subscribe to real-time authentication log changes for specific EID
 export function subscribeToAuthenticationLogByEid(
   eid: string,

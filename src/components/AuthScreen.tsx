@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { CreditCard, Play, Loader2, CheckCircle2, XCircle, User, Radio } from 'lucide-react';
 import { hardware } from '../services/hardware';
 import { getRecentLoginLogs, type AuthenticationLog } from '../services/supabase';
+import { checkThingSpeakOnline } from '../services/thingspeak';
 import { db } from '../services/database';
 import type { User as UserType } from '../types';
 
@@ -11,6 +12,8 @@ export default function AuthScreen() {
   const [isScanning, setIsScanning] = useState(false);
   const [scanTimeRemaining, setScanTimeRemaining] = useState(0);
   const [detectedUser, setDetectedUser] = useState<{ name: string; eid: string; log: AuthenticationLog } | null>(null);
+  const SCAN_WINDOW_SECONDS = 15;
+  const [iotOnline, setIotOnline] = useState<boolean | null>(null);
   
   const scanTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -34,7 +37,27 @@ export default function AuthScreen() {
     initializeLogTracking();
   }, []);
 
-  // Handle 7-second scan window
+  // Check IoT / ThingSpeak status on home screen
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkStatus = async () => {
+      const { online } = await checkThingSpeakOnline(15);
+      if (!cancelled) {
+        setIotOnline(online);
+      }
+    };
+
+    checkStatus();
+    const intervalId = window.setInterval(checkStatus, 15000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  // Handle scan window
   useEffect(() => {
     if (!isScanning) {
       // Clean up all intervals
@@ -58,8 +81,8 @@ export default function AuthScreen() {
       return;
     }
 
-    // Start 7-second countdown
-    setScanTimeRemaining(7);
+    // Start countdown
+    setScanTimeRemaining(SCAN_WINDOW_SECONDS);
     scanStartTimeRef.current = Date.now();
     
     // Countdown timer
@@ -72,11 +95,11 @@ export default function AuthScreen() {
       });
     }, 1000);
 
-    // Auto-stop after 7 seconds
+    // Auto-stop after scan window
     scanTimeoutRef.current = setTimeout(() => {
       setIsScanning(false);
       setScanTimeRemaining(0);
-    }, 7000);
+    }, SCAN_WINDOW_SECONDS * 1000);
 
     // Start RFID scanning
     let isScanningActive = true;
@@ -199,10 +222,26 @@ export default function AuthScreen() {
             </div>
           </div>
 
-          {/* Title */}
-          <h1 className="text-3xl font-bold text-gray-900 text-center mb-2">
-            EV Charging Station
-          </h1>
+          {/* Title + IoT status */}
+          <div className="flex items-center justify-between mb-2">
+            <h1 className="text-3xl font-bold text-gray-900">
+              EV Charging Station
+            </h1>
+            {iotOnline !== null && (
+              <div
+                className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold ${
+                  iotOnline ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    iotOnline ? 'bg-green-500' : 'bg-red-500'
+                  }`}
+                ></span>
+                <span>{iotOnline ? 'IoT Online' : 'IoT Offline'}</span>
+              </div>
+            )}
+          </div>
           
           {/* Subtitle */}
           <p className="text-gray-600 text-center mb-8">
@@ -260,7 +299,7 @@ export default function AuthScreen() {
                 <div className="w-full bg-gray-200 rounded-full h-3 max-w-xs mx-auto">
                   <div 
                     className="bg-blue-600 h-3 rounded-full transition-all duration-1000"
-                    style={{ width: `${(scanTimeRemaining / 7) * 100}%` }}
+                    style={{ width: `${(scanTimeRemaining / SCAN_WINDOW_SECONDS) * 100}%` }}
                   ></div>
                 </div>
               </div>
@@ -291,7 +330,7 @@ export default function AuthScreen() {
                     <ol className="text-sm text-gray-700 space-y-1 list-decimal list-inside">
                       <li>Click the "Scan RFID Card" button below</li>
                       <li>Place your RFID card near the reader</li>
-                      <li>Wait for detection (7 seconds)</li>
+                      <li>Wait for detection (15 seconds)</li>
                       <li>Confirm your identity when detected</li>
                     </ol>
                   </div>
